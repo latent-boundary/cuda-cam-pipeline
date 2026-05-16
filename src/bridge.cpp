@@ -7,7 +7,6 @@
 
 #include "cuda_kernels.h"
 
-
 int main()
 {
     cv::VideoCapture cap(0, cv::CAP_V4L2);
@@ -36,57 +35,77 @@ int main()
 
     int frame_id = 0;
 
-    //FPS測定
+    // FPS measurement
     cv::TickMeter tm;
 
+    // Buffers for frame difference (motion factor)
+    unsigned char *d_prev, *d_diff;
+    cudaMalloc(&d_prev, size);
+    cudaMalloc(&d_diff, size);
+
+    // Initialize d_prev only for the first frame
+    cudaMemcpy(d_prev, gray.data, size, cudaMemcpyHostToDevice);
+
     while (true) {
-        //FPS測定開始
+        // Start FPS timer
         tm.start();
 
-        // パイプライン処理
+        // Capture frame
         cap >> frame;
         if (frame.empty()) break;
 
         cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
 
-        // h_gray → d_src にコピー
+        // Copy grayscale frame to GPU
         cudaError_t err = cudaMemcpy(d_src, gray.data, size, cudaMemcpyHostToDevice);
         if (err != cudaSuccess) {
             printf("Memcpy H→D failed: %s\n", cudaGetErrorString(err));
         }
 
-        // 1 : Gaussian: d_src → d_tmp
+        // 1: Gaussian blur (d_src → d_tmp)
         launch_gaussian5x5(d_src, d_tmp, width, height);
 
-        // 2: Sobel: d_tmp → d_dst
+        // 2: Sobel edge detection (d_tmp → d_dst)
         launch_sobel(d_tmp, d_dst, width, height);
 
-        //  Gaussian → Sobel の順序保証
-        //  Check Kernel Errカーネルエラーが即座に検出
+        // 3: Frame difference (motion factor)
+        launch_frame_diff(d_prev, d_tmp, d_diff, width, height);
         cudaDeviceSynchronize();
 
-        // d_dst → h_edge にコピー
+        // Update previous frame buffer
+        cudaMemcpy(d_prev, d_tmp, size, cudaMemcpyDeviceToDevice);
+
+        // Copy edge result back to CPU
         cv::Mat edge(height, width, CV_8UC1);
         cudaMemcpy(edge.data, d_dst, size, cudaMemcpyDeviceToHost);
 
-        //FPS表示
-        //FPS測定タイマ停止　→　FPS表示 →　FPS再開
+        // Stop FPS timer and print
         tm.stop();
         printf("FPS: %.2f\n", 1.0 / tm.getTimeSec());
         tm.reset();
 
+        // Save edge image every 100 frames
         if (frame_id % 100 == 0) {
             cv::imwrite("edge_" + std::to_string(frame_id) + ".jpg", edge);
             printf("Saved edge_%d.jpg\n", frame_id);
         }
 
+        // Copy motion map to CPU and save
+        cv::Mat diff(height, width, CV_8UC1);
+        cudaMemcpy(diff.data, d_diff, size, cudaMemcpyDeviceToHost);
+
+        if (frame_id % 100 == 0) {
+            cv::imwrite("diff_" + std::to_string(frame_id) + ".jpg", diff);
+        }
+
         frame_id++;
     }
-
 
     cudaFree(d_src);
     cudaFree(d_tmp);
     cudaFree(d_dst);
+    cudaFree(d_prev);
+    cudaFree(d_diff);
 
     return 0;
 }
