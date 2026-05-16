@@ -27,27 +27,53 @@ int main()
 
     int width = gray.cols;
     int height = gray.rows;
-    size_t size = width * height;
+    size_t size = width * height * sizeof(unsigned char);
 
-    unsigned char *d_src, *d_dst;
+    unsigned char *d_src, *d_dst, *d_tmp;
     cudaMalloc(&d_src, size);
+    cudaMalloc(&d_tmp, size);
     cudaMalloc(&d_dst, size);
 
     int frame_id = 0;
 
+    //FPS測定
+    cv::TickMeter tm;
+
     while (true) {
+        //FPS測定開始
+        tm.start();
+
+        // パイプライン処理
         cap >> frame;
         if (frame.empty()) break;
 
         cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
 
-        cudaMemcpy(d_src, gray.data, size, cudaMemcpyHostToDevice);
+        // h_gray → d_src にコピー
+        cudaError_t err = cudaMemcpy(d_src, gray.data, size, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            printf("Memcpy H→D failed: %s\n", cudaGetErrorString(err));
+        }
 
-        // CUDA カーネル呼び出し
-        launch_sobel(d_src, d_dst, width, height);
+        // 1 : Gaussian: d_src → d_tmp
+        launch_gaussian5x5(d_src, d_tmp, width, height);
 
+        // 2: Sobel: d_tmp → d_dst
+        launch_sobel(d_tmp, d_dst, width, height);
+
+        //  Gaussian → Sobel の順序保証
+        //  Check Kernel Errカーネルエラーが即座に検出
+        cudaDeviceSynchronize();
+
+        // d_dst → h_edge にコピー
         cv::Mat edge(height, width, CV_8UC1);
         cudaMemcpy(edge.data, d_dst, size, cudaMemcpyDeviceToHost);
+
+        //FPS表示
+        //FPS測定タイマ停止　→　FPS表示 →　FPS再開
+        tm.stop();
+        printf("FPS: %.2f\n", 1.0 / tm.getTimeSec());
+        tm.reset();
 
         if (frame_id % 100 == 0) {
             cv::imwrite("edge_" + std::to_string(frame_id) + ".jpg", edge);
@@ -57,7 +83,9 @@ int main()
         frame_id++;
     }
 
+
     cudaFree(d_src);
+    cudaFree(d_tmp);
     cudaFree(d_dst);
 
     return 0;
